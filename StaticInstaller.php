@@ -32,11 +32,27 @@ use exface\Core\Interfaces\WorkbenchInterface;
  * When a new workbench is used for every app (the default), the workbench of the previous app is stopped
  * explicitly after the app was installed (see `stopWorkbenchIfNotGlobal()`). This deterministically closes its
  * DB connections and releases any locks/open transactions before the next app starts - instead of relying on
- * PHP's garbage collector, which may defer the cleanup.
+ * PHP's garbage collector, which may defer the cleanup. Note that `Workbench::stop()` alone does NOT close the
+ * model loader's own metamodel connection (it only disconnects data sources registered with the DataManager),
+ * so `stopWorkbenchIfNotGlobal()` additionally commits and disconnects that connection via
+ * `disconnectModelLoader()` - see below.
  * 
- * For example, when using a remote MS SQL database for the metamodel, the installer of the second app being 
- * installed might just hang because the MS SQL connector cannot establish a new connection to the DB. If this happens,
- * use a global workbench here to make every app use the same DB connection.
+ * ## Remote/cloud MS SQL (e.g. Azure SQL): the per-app deadlock and how it is prevented
+ * 
+ * On installations that keep the metamodel in a remote MS SQL / Azure SQL database, starting a new workbench
+ * for every app used to freeze the installation - typically when installing the second app. Every new workbench
+ * opens its own metamodel DB connection = a separate SQL Server session. The meta model of an app is imported
+ * inside a single, comparatively long transaction (see `MetaModelInstaller`), so one session holds write locks
+ * on the shared metamodel tables (`exf_object`, `exf_attribute`, `exf_page`, ...) while it is busy - it shows up
+ * as a "sleeping" session with an open transaction. If the previous app's metamodel session was left open
+ * (because `Workbench::stop()` does not close the model loader connection and the DB driver pools it), the next
+ * app's fresh metamodel session blocks trying to write to those locked tables and appears "suspended" - the
+ * install hangs.
+ * 
+ * This is prevented by `disconnectModelLoader()`, which commits any open transaction and closes the model loader
+ * connection when each per-app workbench is torn down, releasing the SQL Server session and its locks before the
+ * next app starts. Setting `COMPOSER.USE_NEW_WORKBENCH_FOR_EVERY_APP` to FALSE (a single shared workbench and
+ * thus a single reused metamodel session) also avoids the contention entirely.
  *
  * @author Andrej Kabachnik
  *
@@ -356,10 +372,64 @@ class StaticInstaller
         if (static::$globalWorkbench === null && $this->workbench !== null) {
             try {
                 $this->workbench->stop();
+                self::printToStdout('Workbench stopped.');
             } catch (\Throwable $e) {
                 static::printException($e);
             }
+            // IMPORTANT: Workbench::stop() only disconnects data sources registered with the
+            // DataManager (active_sources). The model loader keeps its own metamodel connection
+            // (SqlModelLoader::$data_connection), which is NOT part of that list and therefore
+            // stays open. With connection pooling (e.g. the sqlsrv driver) that leaves the SQL
+            // Server session - and any locks/open transaction from the model import - alive after
+            // the app was installed. When the next app starts with a fresh workbench, it opens a
+            // NEW metamodel session that then blocks on the locks held by the previous, lingering
+            // session => the "sleeping" vs "suspended" deadlock described in the class docblock.
+            // Closing the model loader connection explicitly releases the session and its locks
+            // before the next app begins, which is what makes USE_NEW_WORKBENCH_FOR_EVERY_APP=TRUE
+            // safe on remote/cloud MS SQL (Azure SQL).
+            $this->disconnectModelLoader($this->workbench);
             $this->workbench = null;
+        }
+    }
+
+    /**
+     * Commits any open transaction on the model loader (metamodel) connection and closes it.
+     *
+     * See stopWorkbenchIfNotGlobal() for why this is necessary in per-app mode.
+     *
+     * @param WorkbenchInterface $workbench
+     * @return void
+     */
+    protected function disconnectModelLoader(?WorkbenchInterface $workbench)
+    {
+        $msg = 'Cannot disconnect ModelLoader: ';
+        if ($workbench === null) {
+            self::printToStdout($msg . 'No workbench.');
+            return;
+        }
+        try {
+            $modelLoader = $workbench->model()->getModelLoader();
+            if ($modelLoader === null) {
+                self::printToStdout($msg . 'No ModelLoader registered with workbench.');
+                return;
+            }
+            $connection = $modelLoader->getDataConnection();
+            if ($connection === null) {
+                self::printToStdout($msg . 'ModelLoader has no connection.');
+                return;
+            }
+            // Make sure no transaction stays open before closing the physical connection, so the
+            // DB session is released cleanly instead of being left to an implicit rollback.
+            try {
+                if ($connection->transactionIsStarted()) {
+                    $connection->transactionCommit();
+                }
+            } catch (\Throwable $e) {
+                static::printException($e);
+            }
+            $connection->disconnect();
+        } catch (\Throwable $e) {
+            static::printException($e);
         }
     }
 
@@ -378,6 +448,13 @@ class StaticInstaller
             $action = ActionFactory::createFromString($exface, self::PACKAGE_MANAGER_INSTALL_ACTION_ALIAS);
             $installerResult = $action->installApp($app_selector);
             foreach ($installerResult as $msg) {
+                // Stream every step of the install log to stdout IMMEDIATELY (and flush), instead
+                // of only returning the accumulated log after the generator has finished. If the
+                // install hangs (e.g. on a DB lock) the previously buffered approach would never
+                // print anything, hiding the exact step where it froze. With live output the last
+                // printed line points directly at the operation that is blocking.
+                self::printToStdout($msg);
+                self::flushOutput();
                 $result .= $msg;
             }
         } catch (\Throwable $e) {
@@ -535,6 +612,26 @@ class StaticInstaller
         } else {
             echo $text;
         }
+    }
+
+    /**
+     * Forces any buffered output to be written out immediately.
+     *
+     * This makes streamed install output appear in real time - important when an install step
+     * blocks (e.g. on a DB lock), so the last visible line pinpoints where it froze.
+     *
+     * @return void
+     */
+    protected static function flushOutput()
+    {
+        if (defined('STDOUT') === true && is_resource(STDOUT) === true) {
+            @fflush(STDOUT);
+        }
+        // Flush PHP's output buffers (if any) and the SAPI write buffer
+        if (ob_get_level() > 0) {
+            @ob_flush();
+        }
+        @flush();
     }
 
     protected static function printException(\Throwable $e, $prefix = 'ERROR ')
